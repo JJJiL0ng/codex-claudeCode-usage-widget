@@ -204,12 +204,16 @@ enum CodexUsageFetcher {
         process.executableURL = URL(fileURLWithPath: codexPath)
         process.arguments = ["app-server"]
         process.standardInput = input
+        let errors = Pipe()
         process.standardOutput = output
-        process.standardError = FileHandle.nullDevice
+        process.standardError = errors
+        // Apps launched from Finder get a minimal PATH; the npm-installed codex is a node script and needs `node`.
+        process.environment = cliEnvironment(executablePath: codexPath)
 
         let stateQueue = DispatchQueue(label: "dev.jihong.ai-agent-usage.codex-response")
         let semaphore = DispatchSemaphore(value: 0)
         var buffer = Data()
+        var errorBuffer = Data()
         var result: Result<UsageSnapshot, Error>?
         var finished = false
 
@@ -222,7 +226,11 @@ enum CodexUsageFetcher {
 
         output.fileHandleForReading.readabilityHandler = { handle in
             let data = handle.availableData
-            guard !data.isEmpty else { return }
+            // Empty data means EOF; keeping the handler would make it fire in a tight loop.
+            guard !data.isEmpty else {
+                handle.readabilityHandler = nil
+                return
+            }
 
             stateQueue.async {
                 buffer.append(data)
@@ -245,8 +253,39 @@ enum CodexUsageFetcher {
             }
         }
 
+        errors.fileHandleForReading.readabilityHandler = { handle in
+            let data = handle.availableData
+            guard !data.isEmpty else {
+                handle.readabilityHandler = nil
+                return
+            }
+            stateQueue.async {
+                errorBuffer.append(data)
+                if errorBuffer.count > 8192 { errorBuffer.removeFirst(errorBuffer.count - 8192) }
+            }
+        }
+
+        // If codex exits before answering (e.g. `env: node: No such file or directory`), report why right away
+        // instead of waiting for the timeout. The delay lets any final stdout/stderr chunks arrive first.
+        process.terminationHandler = { _ in
+            stateQueue.asyncAfter(deadline: .now() + 0.3) {
+                let lastLine = String(decoding: errorBuffer, as: UTF8.self)
+                    .split(whereSeparator: \.isNewline)
+                    .last { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
+                    .map(String.init)
+                finish(.failure(UsageError.server("Codex 실행 실패" + (lastLine.map { ": \($0)" } ?? ""))))
+            }
+        }
+
         do {
             try process.run()
+        } catch {
+            output.fileHandleForReading.readabilityHandler = nil
+            errors.fileHandleForReading.readabilityHandler = nil
+            return .failure(error)
+        }
+
+        do {
             let messages = [
                 ["method": "initialize", "id": 0, "params": ["clientInfo": ["name": "ai_agent_usage", "title": "AI Agent Usage", "version": "1.0.0"]]],
                 ["method": "initialized", "params": [:]],
@@ -258,13 +297,12 @@ enum CodexUsageFetcher {
                 try input.fileHandleForWriting.write(contentsOf: data)
             }
         } catch {
-            output.fileHandleForReading.readabilityHandler = nil
-            if process.isRunning { process.terminate() }
-            return .failure(error)
+            // A write fails when codex already exited; the termination handler reports the reason.
         }
 
         let waitResult = semaphore.wait(timeout: .now() + timeout)
         output.fileHandleForReading.readabilityHandler = nil
+        errors.fileHandleForReading.readabilityHandler = nil
         try? input.fileHandleForWriting.close()
         if process.isRunning { process.terminate() }
 
@@ -350,28 +388,16 @@ enum ProcessRunner {
         process.standardOutput = pipe
         process.standardError = pipe
 
-        // Apps launched from Finder get a minimal PATH; node-based CLIs need their own bin dir to find `node`.
-        var environment = ProcessInfo.processInfo.environment
-        let searchPath = [(path as NSString).deletingLastPathComponent, "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"]
-        environment["PATH"] = (searchPath + [environment["PATH"]].compactMap { $0 }).joined(separator: ":")
-        // Claude Code looks up its keychain entry by $USER.
-        environment["USER"] = environment["USER"] ?? NSUserName()
-        environment["LOGNAME"] = environment["LOGNAME"] ?? NSUserName()
-        // When the app is launched from inside a Claude Code session it inherits that session's variables
-        // (CLAUDECODE, CLAUDE_CODE_CHILD_SESSION, its messaging socket…), which makes `claude -p` run as a
-        // child of that session. API keys would also bill the kickoff to the API instead of the subscription.
-        for key in environment.keys where key.hasPrefix("CLAUDE") && key != "CLAUDE_CONFIG_DIR" {
-            environment[key] = nil
-        }
-        ["AI_AGENT", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "OPENAI_API_KEY", "MCP_CONNECTION_NONBLOCKING"].forEach {
-            environment[$0] = nil
-        }
-        process.environment = environment
+        process.environment = cliEnvironment(executablePath: path)
 
         let lock = NSLock()
         var data = Data()
         pipe.fileHandleForReading.readabilityHandler = { handle in
             let chunk = handle.availableData
+            guard !chunk.isEmpty else {
+                handle.readabilityHandler = nil
+                return
+            }
             lock.lock()
             data.append(chunk)
             lock.unlock()
@@ -395,6 +421,27 @@ enum ProcessRunner {
         lock.unlock()
         return ProcessOutput(status: timedOut ? -1 : process.terminationStatus, output: timedOut ? "시간 초과" : text)
     }
+}
+
+/// Environment for child CLIs. Apps launched from Finder get a minimal PATH; node-based CLIs installed
+/// through npm/nvm need their own bin dir on PATH to find `node`.
+func cliEnvironment(executablePath path: String) -> [String: String] {
+    var environment = ProcessInfo.processInfo.environment
+    let searchPath = [(path as NSString).deletingLastPathComponent, "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"]
+    environment["PATH"] = (searchPath + [environment["PATH"]].compactMap { $0 }).joined(separator: ":")
+    // Claude Code looks up its keychain entry by $USER.
+    environment["USER"] = environment["USER"] ?? NSUserName()
+    environment["LOGNAME"] = environment["LOGNAME"] ?? NSUserName()
+    // When the app is launched from inside a Claude Code session it inherits that session's variables
+    // (CLAUDECODE, CLAUDE_CODE_CHILD_SESSION, its messaging socket…), which makes `claude -p` run as a
+    // child of that session. API keys would also bill the kickoff to the API instead of the subscription.
+    for key in environment.keys where key.hasPrefix("CLAUDE") && key != "CLAUDE_CONFIG_DIR" {
+        environment[key] = nil
+    }
+    ["AI_AGENT", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "OPENAI_API_KEY", "MCP_CONNECTION_NONBLOCKING"].forEach {
+        environment[$0] = nil
+    }
+    return environment
 }
 
 /// Sends the smallest possible request so a fresh 5-hour window starts counting right after a reset.
@@ -1073,6 +1120,9 @@ private func selfTest() -> Bool {
     let image = AppDelegate.statusImage([(nil, "98%"), (nil, "91%")])
     return remainingPercent(window) == 91 && hasLogos && claudeOK && kickoffOK && pmsetOK && image.isTemplate && image.size.width > 0
 }
+
+// Writing to a child CLI that already exited must fail with EPIPE instead of killing the app.
+signal(SIGPIPE, SIG_IGN)
 
 if CommandLine.arguments.contains("--self-test") {
     let passed = selfTest()
