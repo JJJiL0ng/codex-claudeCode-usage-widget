@@ -357,6 +357,15 @@ enum ProcessRunner {
         // Claude Code looks up its keychain entry by $USER.
         environment["USER"] = environment["USER"] ?? NSUserName()
         environment["LOGNAME"] = environment["LOGNAME"] ?? NSUserName()
+        // When the app is launched from inside a Claude Code session it inherits that session's variables
+        // (CLAUDECODE, CLAUDE_CODE_CHILD_SESSION, its messaging socket…), which makes `claude -p` run as a
+        // child of that session. API keys would also bill the kickoff to the API instead of the subscription.
+        for key in environment.keys where key.hasPrefix("CLAUDE") && key != "CLAUDE_CONFIG_DIR" {
+            environment[key] = nil
+        }
+        ["AI_AGENT", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "OPENAI_API_KEY", "MCP_CONNECTION_NONBLOCKING"].forEach {
+            environment[$0] = nil
+        }
         process.environment = environment
 
         let lock = NSLock()
@@ -423,13 +432,39 @@ enum KickoffRunner {
             return .failure(agent == .codex ? UsageError.codexNotFound : UsageError.server("Claude Code 실행 파일을 찾지 못했습니다"))
         }
         guard let result = ProcessRunner.run(path, arguments, directory: workingDirectory(), timeout: 120) else {
+            log(agent, path: path, status: nil, output: "process failed to launch")
             return .failure(UsageError.server("\(agent.name) 실행 실패"))
         }
+        log(agent, path: path, status: result.status, output: result.output)
         if result.status == 0 { return .success(()) }
 
         let lines = result.output.split(separator: "\n").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
         let message = lines.last { $0.hasPrefix("ERROR:") } ?? lines.last ?? "종료 코드 \(result.status)"
         return .failure(UsageError.server(String(message.prefix(160))))
+    }
+
+    static let logURL = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent("Library/Logs/AI Agent Usage/kickoff.log")
+
+    /// Appends every kickoff result so failures can be diagnosed after the fact.
+    private static func log(_ agent: Agent, path: String, status: Int32?, output: String) {
+        let formatter = ISO8601DateFormatter()
+        formatter.timeZone = .current
+        let tail = output.split(separator: "\n", omittingEmptySubsequences: false).suffix(30).joined(separator: "\n")
+        let entry = "[\(formatter.string(from: Date()))] \(agent.name) model=\(model(for: agent)) exit=\(status.map(String.init) ?? "-") bin=\(path)\n\(tail)\n\n"
+
+        let fileManager = FileManager.default
+        try? fileManager.createDirectory(at: logURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        if let size = (try? fileManager.attributesOfItem(atPath: logURL.path))?[.size] as? Int, size > 1_000_000 {
+            try? fileManager.removeItem(at: logURL)
+        }
+        if let handle = try? FileHandle(forWritingTo: logURL) {
+            handle.seekToEndOfFile()
+            handle.write(Data(entry.utf8))
+            try? handle.close()
+        } else {
+            try? Data(entry.utf8).write(to: logURL)
+        }
     }
 
     private static func workingDirectory() -> URL {
@@ -506,6 +541,7 @@ final class AgentSection {
     var waiters: [() -> Void] = []
     var resetTimer: DispatchSourceTimer?
     var retryTimer: DispatchSourceTimer?
+    var kickoffFailures = 0
 
     init(agent: Agent) {
         self.agent = agent
@@ -746,11 +782,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let now = Date()
         let lastAttempt = defaults.object(forKey: section.attemptKey) as? Date
         let suppressedUntil = defaults.object(forKey: section.untilKey) as? Date
+        if let window = section.snapshot?.primary, !KickoffRunner.needsKickoff(window, now: now) {
+            section.kickoffFailures = 0
+        }
         guard
             kickoffEnabled(section.agent),
             let window = section.snapshot?.primary,
             KickoffRunner.needsKickoff(window, now: now),
-            lastAttempt.map({ now.timeIntervalSince($0) >= 600 }) ?? true,
+            lastAttempt.map({ now.timeIntervalSince($0) >= 110 }) ?? true,
             suppressedUntil.map({ now >= $0 }) ?? true
         else { done(); return }
 
@@ -769,10 +808,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     let until = reset.flatMap { $0 > now ? $0 : nil }
                         ?? now.addingTimeInterval(TimeInterval(window.durationMinutes * 60 - 900))
                     self.defaults.set(until, forKey: section.untilKey)
+                    section.kickoffFailures = 0
                     section.kickoffItem.title = "자동 시작: \(Self.timeFormatter.string(from: now)) 핑 완료"
                     if let after { self.apply(after, to: section) }
                 case .failure(let error):
-                    section.kickoffItem.title = "자동 시작 실패: \(error.localizedDescription)"
+                    section.kickoffFailures += 1
+                    let retry = section.kickoffFailures < 3
+                    section.kickoffItem.title = "자동 시작 실패\(retry ? " (2분 뒤 재시도)" : ""): \(error.localizedDescription)"
+                    if retry { self.scheduleRetry(section, at: Date().addingTimeInterval(120)) }
                 }
                 done()
             }

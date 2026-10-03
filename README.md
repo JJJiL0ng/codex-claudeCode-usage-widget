@@ -90,6 +90,8 @@ AIAgentUsage --fetch-once         # 남은 사용량 출력
 AIAgentUsage --kickoff claude     # 자동 시작 요청 1회 전송 (사용량 소모)
 ```
 
+자동 시작 결과는 `~/Library/Logs/AI Agent Usage/kickoff.log`에 기록됩니다.
+
 </details>
 
 <br>
